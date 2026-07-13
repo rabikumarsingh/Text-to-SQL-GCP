@@ -3,7 +3,7 @@ import sys
 import uuid
 
 import requests
-
+import time
 
 SERVICE_URL = os.environ["SERVICE_URL"].rstrip("/")
 
@@ -20,24 +20,58 @@ payload = {
 }
 
 
-def call_query():
-    response = requests.post(
-        QUERY_URL,
-        json=payload,
-        timeout=180,
-    )
+def call_query(max_attempts=5):
+    retryable_status_codes = {
+        429,
+        500,
+        502,
+        503,
+        504,
+    }
 
-    response.raise_for_status()
+    for attempt in range(1, max_attempts + 1):
+        print(
+            f"Calling /query "
+            f"(attempt {attempt}/{max_attempts})..."
+        )
 
-    data = response.json()
+        response = requests.post(
+            QUERY_URL,
+            json=payload,
+            timeout=180,
+        )
 
-    assert data["session_id"] == session_id
-    assert isinstance(data["answer"], str)
-    assert len(data["answer"]) > 0
-    assert data["cache_status"] in {"MISS", "HIT"}
+        if response.ok:
+            data = response.json()
 
-    return data
+            assert data["session_id"] == session_id
+            assert isinstance(data["answer"], str)
+            assert len(data["answer"]) > 0
+            assert data["cache_status"] in {"MISS", "HIT"}
 
+            return data
+
+        print(
+            f"Request failed: HTTP {response.status_code}"
+        )
+        print(response.text)
+
+        if (
+            response.status_code not in retryable_status_codes
+            or attempt == max_attempts
+        ):
+            response.raise_for_status()
+
+        wait_seconds = 10 * attempt
+
+        print(
+            f"Transient failure. Retrying in "
+            f"{wait_seconds} seconds..."
+        )
+
+        time.sleep(wait_seconds)
+
+    raise RuntimeError("Integration test exhausted retries.")
 
 print("Running first query...")
 
