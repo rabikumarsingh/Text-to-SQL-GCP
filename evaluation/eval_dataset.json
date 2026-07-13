@@ -1,0 +1,29 @@
+[
+  {
+    "id": "eval_001",
+    "question": "How many taxi trips occurred in 2022?",
+    "expected_metric": "total_trips",
+    "expected_dimensions": ["trip_start_timestamp"],
+    "expected_tables": ["taxi_trips"],
+    "reference_sql": "SELECT COUNT(DISTINCT unique_key) AS result FROM `bigquery-public-data.chicago_taxi_trips.taxi_trips` WHERE EXTRACT(YEAR FROM trip_start_timestamp) = 2022"
+  },
+  {
+    "id": "eval_002",
+    "question": "What was the average taxi fare in 2021?",
+    "expected_metric": "average_fare",
+    "expected_dimensions": ["trip_start_timestamp"],
+    "expected_tables": ["taxi_trips"],
+    "reference_sql": "SELECT AVG(fare) AS result FROM `bigquery-public-data.chicago_taxi_trips.taxi_trips` WHERE EXTRACT(YEAR FROM trip_start_timestamp) = 2021"
+  },
+  {
+    "id": "eval_003",
+    "question": "Which company category generated the highest total revenue in 2023?",
+    "expected_metric": "total_revenue",
+    "expected_dimensions": ["company_category"],
+    "expected_tables": [
+      "taxi_trips",
+      "company_master"
+    ],
+    "reference_sql": "SELECT cm.company_category, SUM(tt.trip_total) AS total_revenue FROM `bigquery-public-data.chicago_taxi_trips.taxi_trips` tt INNER JOIN `test-to-sql-502205.text_to_sql.company_master` cm ON tt.company = cm.company_name WHERE EXTRACT(YEAR FROM tt.trip_start_timestamp) = 2023 GROUP BY cm.company_category ORDER BY total_revenue DESC LIMIT 1"
+  }
+]

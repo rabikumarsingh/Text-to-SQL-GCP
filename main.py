@@ -11,8 +11,13 @@ from google.adk.runners import Runner
 from google.adk.sessions import DatabaseSessionService
 from google.genai import types
 
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
 from text_to_sql_agent.agent import root_agent
 from text_to_sql_agent.services.cache_service import cache_service
+from text_to_sql_agent.services.tracing_service import configure_tracing
 
 
 load_dotenv()
@@ -30,10 +35,19 @@ app = FastAPI(
     description=(
         "Semantic-layer-driven Text-to-SQL Agent "
         "built with Google ADK, BigQuery, Cloud SQL, "
-        "and Redis caching."
+        "Redis caching, and OpenTelemetry tracing."
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
+
+
+tracer = configure_tracing()
+
+
+FastAPIInstrumentor.instrument_app(app)
+
+
+RequestsInstrumentor().instrument()
 
 
 # ==========================================================
@@ -41,9 +55,14 @@ app = FastAPI(
 # ==========================================================
 
 DB_USER = "adk_user"
+
 DB_NAME = "adk_sessions"
 
-DB_PASSWORD = os.getenv("ADK_DB_PASSWORD")
+
+DB_PASSWORD = os.getenv(
+    "ADK_DB_PASSWORD"
+)
+
 
 INSTANCE_CONNECTION_NAME = (
     "test-to-sql-502205:"
@@ -53,12 +72,15 @@ INSTANCE_CONNECTION_NAME = (
 
 
 if not DB_PASSWORD:
+
     raise RuntimeError(
         "ADK_DB_PASSWORD environment variable is missing."
     )
 
 
-encoded_password = quote_plus(DB_PASSWORD)
+encoded_password = quote_plus(
+    DB_PASSWORD
+)
 
 
 DB_URL = (
@@ -172,148 +194,246 @@ async def query_agent(
     request: QueryRequest,
 ):
 
-    # ------------------------------------------------------
-    # Generate or reuse session ID
-    # ------------------------------------------------------
-
     session_id = (
         request.session_id
         or str(uuid.uuid4())
     )
 
-    try:
+    with tracer.start_as_current_span(
+        "text_to_sql.query"
+    ) as query_span:
 
-        # --------------------------------------------------
-        # Redis Cache Lookup
-        # Cache key = user_id + session_id + question
-        # --------------------------------------------------
-
-        cached_response = await cache_service.get(
-            user_id=request.user_id,
-            session_id=session_id,
-            question=request.question,
+        query_span.set_attribute(
+            "text_to_sql.question.length",
+            len(request.question),
         )
 
-        if cached_response is not None:
+        query_span.set_attribute(
+            "text_to_sql.session.provided",
+            request.session_id is not None,
+        )
+
+        try:
+
+            # ==============================================
+            # REDIS CACHE LOOKUP
+            # ==============================================
+
+            with tracer.start_as_current_span(
+                "redis.cache_lookup"
+            ) as cache_span:
+
+                cached_response = await cache_service.get(
+                    user_id=request.user_id,
+                    session_id=session_id,
+                    question=request.question,
+                )
+
+                cache_hit = (
+                    cached_response is not None
+                )
+
+                cache_span.set_attribute(
+                    "cache.hit",
+                    cache_hit,
+                )
+
+            if cached_response is not None:
+
+                query_span.set_attribute(
+                    "text_to_sql.cache_status",
+                    "HIT",
+                )
+
+                return QueryResponse(
+                    session_id=session_id,
+                    answer=cached_response["answer"],
+                    cache_status="HIT",
+                )
+
+
+            # ==============================================
+            # CLOUD SQL SESSION LOOKUP
+            # ==============================================
+
+            with tracer.start_as_current_span(
+                "cloudsql.session_lookup"
+            ) as session_lookup_span:
+
+                session = await session_service.get_session(
+                    app_name=APP_NAME,
+                    user_id=request.user_id,
+                    session_id=session_id,
+                )
+
+                session_lookup_span.set_attribute(
+                    "session.exists",
+                    session is not None,
+                )
+
+
+            # ==============================================
+            # CLOUD SQL SESSION CREATE
+            # ==============================================
+
+            if session is None:
+
+                with tracer.start_as_current_span(
+                    "cloudsql.session_create"
+                ):
+
+                    await session_service.create_session(
+                        app_name=APP_NAME,
+                        user_id=request.user_id,
+                        session_id=session_id,
+                    )
+
+
+            # ==============================================
+            # CREATE ADK MESSAGE
+            # ==============================================
+
+            user_message = types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        text=request.question
+                    )
+                ],
+            )
+
+
+            # ==============================================
+            # EXECUTE ADK AGENT
+            # ==============================================
+
+            final_answer = None
+
+            event_count = 0
+
+
+            with tracer.start_as_current_span(
+                "adk.agent_execution"
+            ) as agent_span:
+
+                async for event in runner.run_async(
+                    user_id=request.user_id,
+                    session_id=session_id,
+                    new_message=user_message,
+                ):
+
+                    event_count += 1
+
+                    if not event.is_final_response():
+                        continue
+
+                    if (
+                        event.content is None
+                        or event.content.parts is None
+                    ):
+                        continue
+
+                    text_parts = [
+                        part.text
+                        for part in event.content.parts
+                        if getattr(
+                            part,
+                            "text",
+                            None,
+                        )
+                    ]
+
+                    if text_parts:
+
+                        final_answer = "".join(
+                            text_parts
+                        )
+
+
+                agent_span.set_attribute(
+                    "adk.event_count",
+                    event_count,
+                )
+
+                agent_span.set_attribute(
+                    "adk.final_response.present",
+                    final_answer is not None,
+                )
+
+
+            # ==============================================
+            # VALIDATE AGENT RESPONSE
+            # ==============================================
+
+            if not final_answer:
+
+                raise RuntimeError(
+                    "Agent returned no final response."
+                )
+
+
+            # ==============================================
+            # REDIS CACHE WRITE
+            # ==============================================
+
+            with tracer.start_as_current_span(
+                "redis.cache_write"
+            ):
+
+                await cache_service.set(
+                    user_id=request.user_id,
+                    session_id=session_id,
+                    question=request.question,
+                    value={
+                        "answer": final_answer,
+                    },
+                )
+
+
+            # ==============================================
+            # FINAL TRACE ATTRIBUTES
+            # ==============================================
+
+            query_span.set_attribute(
+                "text_to_sql.cache_status",
+                "MISS",
+            )
+
+            query_span.set_attribute(
+                "text_to_sql.answer.length",
+                len(final_answer),
+            )
+
+
+            # ==============================================
+            # RETURN RESPONSE
+            # ==============================================
 
             return QueryResponse(
                 session_id=session_id,
-                answer=cached_response["answer"],
-                cache_status="HIT",
+                answer=final_answer,
+                cache_status="MISS",
             )
 
-        # --------------------------------------------------
-        # Load Existing ADK Session From Cloud SQL
-        # --------------------------------------------------
 
-        session = await session_service.get_session(
-            app_name=APP_NAME,
-            user_id=request.user_id,
-            session_id=session_id,
-        )
+        except Exception as exc:
 
-        # --------------------------------------------------
-        # Create Session If Missing
-        # --------------------------------------------------
-
-        if session is None:
-
-            await session_service.create_session(
-                app_name=APP_NAME,
-                user_id=request.user_id,
-                session_id=session_id,
+            query_span.record_exception(
+                exc
             )
 
-        # --------------------------------------------------
-        # Convert Question To ADK Message
-        # --------------------------------------------------
-
-        user_message = types.Content(
-            role="user",
-            parts=[
-                types.Part(
-                    text=request.question
+            query_span.set_status(
+                trace.Status(
+                    trace.StatusCode.ERROR,
+                    str(exc),
                 )
-            ],
-        )
-
-        # --------------------------------------------------
-        # Execute ADK Agent
-        # --------------------------------------------------
-
-        final_answer = None
-
-        async for event in runner.run_async(
-            user_id=request.user_id,
-            session_id=session_id,
-            new_message=user_message,
-        ):
-
-            if not event.is_final_response():
-                continue
-
-            if (
-                event.content is None
-                or event.content.parts is None
-            ):
-                continue
-
-            text_parts = [
-                part.text
-                for part in event.content.parts
-                if getattr(
-                    part,
-                    "text",
-                    None,
-                )
-            ]
-
-            if text_parts:
-
-                final_answer = "".join(
-                    text_parts
-                )
-
-        # --------------------------------------------------
-        # Validate Agent Response
-        # --------------------------------------------------
-
-        if not final_answer:
-
-            raise RuntimeError(
-                "Agent returned no final response."
             )
 
-        # --------------------------------------------------
-        # Store Response In Redis
-        # Cache key = user_id + session_id + question
-        # --------------------------------------------------
+            raise HTTPException(
+                status_code=500,
+                detail=str(exc),
+            ) from exc
 
-        await cache_service.set(
-            user_id=request.user_id,
-            session_id=session_id,
-            question=request.question,
-            value={
-                "answer": final_answer,
-            },
-        )
-
-        # --------------------------------------------------
-        # Return Response
-        # --------------------------------------------------
-
-        return QueryResponse(
-            session_id=session_id,
-            answer=final_answer,
-            cache_status="MISS",
-        )
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        ) from exc
 
 # ==========================================================
 # LOCAL ENTRYPOINT
@@ -323,20 +443,14 @@ if __name__ == "__main__":
 
     import uvicorn
 
-
     uvicorn.run(
-
         "main:app",
-
         host="0.0.0.0",
-
         port=int(
             os.getenv(
                 "PORT",
                 "8080",
             )
         ),
-
         reload=True,
-
     )

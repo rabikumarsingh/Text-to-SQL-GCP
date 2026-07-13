@@ -10,3 +10,10 @@ sqlalchemy
 asyncpg
 redis
 pytest
+google-cloud-aiplatform[evaluation]
+# python -m pip install 
+opentelemetry-api 
+opentelemetry-sdk 
+opentelemetry-exporter-gcp-trace 
+opentelemetry-instrumentation-fastapi 
+opentelemetry-instrumentation-requests
