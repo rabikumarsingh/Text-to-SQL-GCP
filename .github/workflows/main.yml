@@ -72,6 +72,19 @@ jobs:
             --project=${{ env.PROJECT_ID }} \
             --quiet
 
+      # - name: Verify Deployment
+      #   run: |
+      #     SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+      #       --region=${{ env.REGION }} \
+      #       --project=${{ env.PROJECT_ID }} \
+      #       --format="value(status.url)")
+
+      #     echo "Checking: ${SERVICE_URL}/health"
+
+      #     curl --fail \
+      #       --retry 5 \
+      #       --retry-delay 10 \
+      #       "${SERVICE_URL}/health"
       - name: Verify Deployment
         run: |
           SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
@@ -79,9 +92,15 @@ jobs:
             --project=${{ env.PROJECT_ID }} \
             --format="value(status.url)")
 
+          echo "SERVICE_URL=${SERVICE_URL}" >> $GITHUB_ENV
+
           echo "Checking: ${SERVICE_URL}/health"
 
           curl --fail \
             --retry 5 \
             --retry-delay 10 \
             "${SERVICE_URL}/health"
+
+      - name: Run Integration Test
+        run: |
+          python tests/integration_test.py
